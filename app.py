@@ -1,37 +1,37 @@
-"""Pebble Index 01 -> Claude context router.
+"""Pebble Index 01 -> new Claude session per recording.
 
 Receives Index 01 webhook deliveries (protocol v1, see INDEX_WEBHOOK_API.md in
-coredevices/mobileapp), verifies the HMAC signature, asks Claude which route the
-spoken prompt belongs to, and forwards it to that route's destination webhook.
+coredevices/mobileapp), verifies the HMAC signature, and fires a Claude Code
+scheduled task's API trigger with the transcript. Each fire starts a new Claude
+session that reads the recording and decides what to do with it.
 """
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
-import anthropic
 import requests
 from flask import Flask, request
-
-from routes import ROUTES, TRIGGER_OVERRIDES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pebble-router")
 
 SIGNING_SECRET = os.environ.get("INDEX_WEBHOOK_SECRET", "").encode()
-BEARER_TOKEN = os.environ.get("ROUTER_TOKEN", "")  # optional extra header auth
+ROUTER_TOKEN = os.environ.get("ROUTER_TOKEN", "")  # optional extra header auth
+FIRE_URL = os.environ.get("ROUTINE_FIRE_URL", "")  # https://api.anthropic.com/v1/claude_code/routines/<id>/fire
+FIRE_TOKEN = os.environ.get("ROUTINE_TOKEN", "")
+FIRE_BETA = os.environ.get("ROUTINE_BETA", "experimental-cc-routine-2026-04-01")
 MAX_SKEW_SECONDS = 300
-MODEL = os.environ.get("ROUTER_MODEL", "claude-opus-5-5")
 
 app = Flask(__name__)
-client = anthropic.Anthropic()
 
 _seen: dict[str, float] = {}
 _seen_lock = threading.Lock()
+SEEN_TTL = 24 * 3600  # the app retries for ~10 minutes; keep IDs well past that
 
 
 # ---------- webhook verification ----------
@@ -40,7 +40,7 @@ def _verify(raw_body: bytes) -> tuple[bool, str]:
     h = request.headers
     if h.get("X-Index-Webhook-Version") != "1":
         return False, "unsupported webhook version"
-    if BEARER_TOKEN and h.get("Authorization") != f"Bearer {BEARER_TOKEN}":
+    if ROUTER_TOKEN and h.get("Authorization") != f"Bearer {ROUTER_TOKEN}":
         return False, "bad token"
     if not SIGNING_SECRET:
         return True, "unsigned (INDEX_WEBHOOK_SECRET not set)"
@@ -60,107 +60,50 @@ def _verify(raw_body: bytes) -> tuple[bool, str]:
     return True, "ok"
 
 
-def _already_seen(delivery_id: str) -> bool:
+def _was_fired(delivery_id: str) -> bool:
     now = time.time()
     with _seen_lock:
-        for k in [k for k, t in _seen.items() if now - t > 2 * MAX_SKEW_SECONDS]:
+        for k in [k for k, t in _seen.items() if now - t > SEEN_TTL]:
             del _seen[k]
-        if delivery_id in _seen:
-            return True
-        _seen[delivery_id] = now
-        return False
+        return delivery_id in _seen
 
 
-# ---------- Claude routing ----------
-
-ROUTE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "route": {"type": "string", "enum": list(ROUTES)},
-        "confidence": {"type": "number"},
-        "title": {"type": "string"},
-        "cleaned_prompt": {"type": "string"},
-        "entities": {
-            "type": "object",
-            "properties": {
-                "people": {"type": "array", "items": {"type": "string"}},
-                "organizations": {"type": "array", "items": {"type": "string"}},
-                "association": {"type": "string"},
-                "due": {"type": "string"},
-                "amount": {"type": "string"},
-            },
-            "required": ["people", "organizations", "association", "due", "amount"],
-            "additionalProperties": False,
-        },
-        "reason": {"type": "string"},
-    },
-    "required": ["route", "confidence", "title", "cleaned_prompt", "entities", "reason"],
-    "additionalProperties": False,
-}
-
-SYSTEM_PROMPT = (
-    "You route short voice prompts dictated into a smart ring by someone who raises money "
-    "for medical associations and drives their memberships. Pick exactly one route for the "
-    "prompt based on what the speaker wants done.\n\nRoutes:\n"
-    + "\n".join(f"- {name}: {r['description']}" for name, r in ROUTES.items())
-    + "\n\nAlso return a short title, the prompt rewritten as a clear instruction with filler "
-    "words and transcription errors fixed (keep the speaker's meaning), any people, "
-    "organizations, association name or code, due date/time (as spoken, or empty), and dollar "
-    "amount mentioned (empty strings / empty lists when absent). confidence is 0-1. If nothing "
-    "fits well, use the 'note' route."
-)
+def _mark_fired(delivery_id: str) -> None:
+    with _seen_lock:
+        _seen[delivery_id] = time.time()
 
 
-def classify(transcript: str, recorded_at: str) -> dict:
-    response = client.beta.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        system=SYSTEM_PROMPT,
-        output_config={"effort": "low", "format": {"type": "json_schema", "schema": ROUTE_SCHEMA}},
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        messages=[{
-            "role": "user",
-            "content": f"Recorded at (unix ms): {recorded_at}\n\nTranscript:\n{transcript}",
-        }],
-    )
-    if response.stop_reason == "refusal":
-        raise RuntimeError("Claude declined to classify this prompt")
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+# ---------- fire the Claude session ----------
+
+GESTURES = {"single-click-hold": "Hold & talk", "double-click-hold": "Double click & hold"}
 
 
-# ---------- dispatch ----------
-
-def dispatch(decision: dict, payload: dict) -> str:
-    route = ROUTES[decision["route"]]
-    url = os.environ.get(route["env"], "")
-    body = {**payload, **decision}
-    if not url:
-        log.info("route=%s (no %s set, logged only): %s", decision["route"], route["env"], body)
-        return "logged"
-    r = requests.post(url, json=body, timeout=15)
-    r.raise_for_status()
-    return f"forwarded ({r.status_code})"
-
-
-def process(transcript: str, recorded_at: str, trigger: str, delivery_id: str) -> None:
+def _fire_text(transcript: str, recorded_at: str, trigger: str, delivery_id: str) -> str:
     try:
-        forced = TRIGGER_OVERRIDES.get(trigger)
-        decision = classify(transcript, recorded_at)
-        if forced:
-            decision["reason"] = f"forced by gesture {trigger}; model suggested {decision['route']}"
-            decision["route"] = forced
-        result = dispatch(decision, {
-            "transcript": transcript,
-            "recorded_at": recorded_at,
-            "trigger": trigger,
-            "delivery_id": delivery_id,
-        })
-        log.info("delivery=%s route=%s conf=%.2f -> %s",
-                 delivery_id, decision["route"], decision["confidence"], result)
-    except Exception:
-        log.exception("delivery=%s failed", delivery_id)
+        when = datetime.fromtimestamp(int(recorded_at) / 1000, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        when = "unknown"
+    return (
+        "Source: Pebble Index 01 ring voice recording\n"
+        f"Recorded at (UTC): {when}\n"
+        f"Gesture: {GESTURES.get(trigger, trigger or 'unknown')}\n"
+        f"Delivery ID: {delivery_id}\n\n"
+        f"Transcript:\n{transcript}"
+    )
+
+
+def fire_session(text: str) -> requests.Response:
+    return requests.post(
+        FIRE_URL,
+        headers={
+            "Authorization": f"Bearer {FIRE_TOKEN}",
+            "anthropic-beta": FIRE_BETA,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={"text": text},
+        timeout=30,
+    )
 
 
 @app.post("/index-webhook")
@@ -169,28 +112,45 @@ def index_webhook():
     ok, why = _verify(raw)
     if not ok:
         log.warning("rejected: %s", why)
-        return why, 401 if "signature" in why or "token" in why or "expired" in why else 400
+        return why, 401 if why in ("invalid signature", "bad token", "expired request") else 400
 
     delivery_id = request.headers.get("X-Index-Delivery", "")
     trigger = request.headers.get("X-Index-Trigger", "")
     if request.headers.get("X-Index-Test") == "true":
-        log.info("test event received (%s)", why)
+        log.info("test event received (%s); session firing %s", why,
+                 "configured" if FIRE_URL and FIRE_TOKEN else "NOT configured")
         return "test ok", 200
-    if delivery_id and _already_seen(delivery_id):
+    if delivery_id and _was_fired(delivery_id):
         return "already received", 200
 
     transcript = (request.form.get("transcription") or "").strip()
     if not transcript:
-        # Audio-only payloads carry nothing to route; set the ring to "Transcription only" or "Both".
+        # Audio-only payloads carry nothing to send; set the ring to "Transcription only" or "Both".
+        log.info("delivery=%s has no transcription; ignored", delivery_id)
         return "no transcription in payload", 200
 
-    # Reply fast so the app doesn't retry; route in the background.
-    threading.Thread(
-        target=process,
-        args=(transcript, request.form.get("recordedAt", ""), trigger, delivery_id),
-        daemon=True,
-    ).start()
-    return "accepted", 202
+    if not (FIRE_URL and FIRE_TOKEN):
+        log.error("delivery=%s: ROUTINE_FIRE_URL / ROUTINE_TOKEN not set", delivery_id)
+        return "session target not configured", 503  # the ring app retries
+
+    text = _fire_text(transcript, request.form.get("recordedAt", ""), trigger, delivery_id)
+    try:
+        r = fire_session(text)
+    except requests.RequestException as e:
+        log.error("delivery=%s fire failed: %s", delivery_id, e)
+        return "could not reach Claude", 502
+
+    if r.ok:
+        if delivery_id:
+            _mark_fired(delivery_id)
+        session_url = (r.json() or {}).get("claude_code_session_url", "")
+        log.info("delivery=%s -> new session %s", delivery_id, session_url)
+        return "session started", 200
+
+    log.error("delivery=%s fire returned %s: %s", delivery_id, r.status_code, r.text[:300])
+    # Any 5xx makes the ring app retry (every minute, up to 10 times), so a bad token or
+    # the 30-fires-per-hour limit doesn't lose the recording.
+    return f"Claude returned {r.status_code}", 503
 
 
 @app.get("/healthz")
