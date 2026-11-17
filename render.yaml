@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: pebble-router
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 --threads 8 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: INDEX_WEBHOOK_SECRET
+        sync: false
+      - key: ROUTE_URL_TASK
+        sync: false
+      - key: ROUTE_URL_EMAIL_DRAFT
+        sync: false
+      - key: ROUTE_URL_SPONSOR
+        sync: false
+      - key: ROUTE_URL_MEMBERSHIP
+        sync: false
+      - key: ROUTE_URL_EVENT
+        sync: false
+      - key: ROUTE_URL_QUESTION
+        sync: false
+      - key: ROUTE_URL_NOTE
+        sync: false

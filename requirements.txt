@@ -1,0 +1,4 @@
+anthropic>=2.9.0
+flask
+gunicorn
+requests
